@@ -121,14 +121,20 @@ uint32_t lfsrState8Bit = 0xACE1u;
 float cmosPhase = 0.f;
 float eightBitPhase = 0.f;
 
-float b0 = 0.f, b1_p = 0.f, b2 = 0.f, b3 = 0.f, b4 = 0.f, b5 = 0.f, b6 = 0.f;
-float lastWhite = 0.f;
-float lastPink = 0.f;
+// Q1.31 fixed-point pink filter accumulators
+int32_t b0 = 0, b1_p = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;
+int32_t lastWhite = 0;
+int32_t lastPink = 0;
+
+// Q1.31 multiply: (a * b) >> 31, using 64-bit intermediate
+static inline int32_t q31_mul(int32_t a, int32_t b) {
+    return (int32_t)(((int64_t)a * b) >> 31);
+}
 
 // xoshiro128** PRNG — much better spectral quality for audio noise
 uint32_t rng_s[4] = {123456789, 362436069, 521288629, 88675123};
 
-inline int16_t i_random() {
+inline int32_t i_random() {
     uint32_t result = rng_s[1] * 5;
     result = (result << 7 | result >> 25) * 9;
 
@@ -140,60 +146,66 @@ inline int16_t i_random() {
     rng_s[2] ^= t;
     rng_s[3] = (rng_s[3] << 11) | (rng_s[3] >> 21);
 
-    return (int16_t)(result >> 16);
+    return (int32_t)result;
 }
 
-int16_t whiteNoiseValue = 0;
-bool whiteGenerated = false;
-
-inline int16_t nextWhite() {
-    if (!whiteGenerated) {
-        whiteNoiseValue = i_random();
-        whiteGenerated = true;
-    }
-    return whiteNoiseValue;
+inline int32_t nextWhite() {
+    return i_random();
 }
 
-float pinkNoiseValue = 0.f;
-bool pinkGenerated = false;
+// Paul Kellet's pink noise filter coefficients in Q1.31
+// Feedback coefficients (multiply accumulator)
+static const int32_t PK_FB0 = 2145663025;  // 0.99886 * 2^31
+static const int32_t PK_FB1 = 2133763072;  // 0.99332 * 2^31
+static const int32_t PK_FB2 = 2082504499;  // 0.96900 * 2^31
+static const int32_t PK_FB3 = 1861025464;  // 0.86650 * 2^31
+static const int32_t PK_FB4 = 1181116006;  // 0.55000 * 2^31
+static const int32_t PK_FB5 = -1635778150; // -0.7616 * 2^31
+// Input coefficients (multiply white noise)
+static const int32_t PK_IN0 = 119246061;   // 0.0555179 * 2^31
+static const int32_t PK_IN1 = 161249019;   // 0.0750759 * 2^31
+static const int32_t PK_IN2 = 330469744;   // 0.1538520 * 2^31
+static const int32_t PK_IN3 = 666871054;   // 0.3104856 * 2^31
+static const int32_t PK_IN4 = 1144764160;  // 0.5329522 * 2^31
+static const int32_t PK_IN5 = -36285818;   // -0.0168980 * 2^31
+static const int32_t PK_IN6 = 248963605;   // 0.115926 * 2^31
+static const int32_t PK_SUM = 1151448227;  // 0.5362 * 2^31
+static const int32_t PK_GAIN = 236223201;  // 0.11 * 2^31
 
-inline float nextPink() {
-    if (!pinkGenerated) {
-        float w = (float)nextWhite() * (1.0f / 32768.0f);
-        b0 = 0.99886f * b0 + w * 0.0555179f;
-        b1_p = 0.99332f * b1_p + w * 0.0750759f;
-        b2 = 0.96900f * b2 + w * 0.1538520f;
-        b3 = 0.86650f * b3 + w * 0.3104856f;
-        b4 = 0.55000f * b4 + w * 0.5329522f;
-        b5 = -0.7616f * b5 - w * 0.0168980f;
-        pinkNoiseValue = b0 + b1_p + b2 + b3 + b4 + b5 + b6 + w * 0.5362f;
-        b6 = w * 0.115926f;
-        pinkNoiseValue *= 0.11f;
-        pinkGenerated = true;
-    }
-    return pinkNoiseValue;
+inline int32_t nextPink() {
+    int32_t w = nextWhite();
+    b0 = q31_mul(PK_FB0, b0) + q31_mul(PK_IN0, w);
+    b1_p = q31_mul(PK_FB1, b1_p) + q31_mul(PK_IN1, w);
+    b2 = q31_mul(PK_FB2, b2) + q31_mul(PK_IN2, w);
+    b3 = q31_mul(PK_FB3, b3) + q31_mul(PK_IN3, w);
+    b4 = q31_mul(PK_FB4, b4) + q31_mul(PK_IN4, w);
+    b5 = q31_mul(PK_FB5, b5) + q31_mul(PK_IN5, w);
+    // Sum all filter bands + direct path
+    int32_t pink = (b0 >> 3) + (b1_p >> 3) + (b2 >> 3) + (b3 >> 3)
+                 + (b4 >> 3) + (b5 >> 3) + (b6 >> 3) + q31_mul(PK_SUM, w >> 3);
+    b6 = q31_mul(PK_IN6, w);
+    return q31_mul(PK_GAIN, pink);
 }
 
-inline float nextBlue() {
-    float p = nextPink();
-    float blue = p - lastPink;
+inline int32_t nextBlue() {
+    int32_t p = nextPink();
+    int32_t blue = p - lastPink;
     lastPink = p;
-    return blue * 10.f;
+    return blue;  // differentiation already boosts highs
 }
 
-inline float nextViolet() {
-    float w = (float)nextWhite() * (1.0f / 32768.0f);
-    float violet = w - lastWhite;
+inline int32_t nextViolet() {
+    int32_t w = nextWhite();
+    int32_t violet = w - lastWhite;
     lastWhite = w;
-    return violet * 0.707f;
+    return violet >> 1;  // ~0.707 approximated as >>1 (0.5), keeps levels safe
 }
 
-inline int16_t nextVelvet(float p) {
-    // Integer probability comparison: scale p to 0-65535 range
-    uint32_t thresh = (uint32_t)(p * 65536.0f);
-    uint32_t r = (uint32_t)((int32_t)i_random() + 32768);
+inline int32_t nextVelvet(uint32_t thresh) {
+    // thresh is pre-scaled probability in 0..UINT32_MAX range
+    uint32_t r = (uint32_t)i_random();
     if (r < thresh) {
-        return i_random() >= 0 ? 32767 : -32768;
+        return i_random() >= 0 ? INT32_MAX : INT32_MIN;
     }
     return 0;
 }
@@ -226,96 +238,86 @@ void loop1() {
 
     static float tone = 0.5f;
     
-    static float lpCutoff = 1000.f;
-    static float hpCutoff = 1000.f;
-    static float gLp = 1.0f;
-    static float gHp = 1.0f;
+    // Filter coefficients in Q1.31 (computed from tone, updated each sample)
+    static int32_t gLp_q31 = 0;
+    static int32_t gHp_q31 = 0;
     static bool isHp = false;
     
-    static float velvetProb = 0.f;
+    // Velvet threshold in uint32_t range
+    static uint32_t velvetThresh = 0;
     static float cmosRate = 1000.f;
     static float eightBitRate = 1000.f;
 
-    static float lpState = 0.f;
-    static float hpState = 0.f;
+    // LP/HP filter state in Q1.31
+    static int32_t lpState = 0;
+    static int32_t hpState = 0;
 
     tone = noiseData.tone;
 
-    // TODO: Only recalculate the data that is necessary
-    // Recalculate coefficients
+    // Recalculate filter coefficients (float here is fine — runs once per sample,
+    // not in a tight inner loop, and pow() is inherently float)
     float lp_tone = tone / 0.5f;
     if (lp_tone > 1.0f) lp_tone = 1.0f;
-    lpCutoff = pow(10.f, 1.f + 3.3f * lp_tone);
+    float lpCutoff = pow(10.f, 1.f + 3.3f * lp_tone);
     
     float hp_tone = (tone - 0.5f) / 0.5f;
     if (hp_tone < 0.0f) hp_tone = 0.0f;
-    hpCutoff = pow(10.f, 1.f + 3.3f * hp_tone);
+    float hpCutoff = pow(10.f, 1.f + 3.3f * hp_tone);
 
-    gLp = lpCutoff * (1.0f/44100.f) * 3.14159f;
-    if (gLp > 1.0f) gLp = 1.0f;
+    float gLp_f = lpCutoff * (1.0f/44100.f) * 3.14159f;
+    if (gLp_f > 1.0f) gLp_f = 1.0f;
+    gLp_q31 = (int32_t)(gLp_f * 2147483647.0f);
     
-    gHp = hpCutoff * (1.0f/44100.f) * 3.14159f;
-    if (gHp > 1.0f) gHp = 1.0f;
+    float gHp_f = hpCutoff * (1.0f/44100.f) * 3.14159f;
+    if (gHp_f > 1.0f) gHp_f = 1.0f;
+    gHp_q31 = (int32_t)(gHp_f * 2147483647.0f);
 
     isHp = tone >= 0.5f;
 
-    whiteGenerated = false;
-    pinkGenerated = false;
-
     int32_t outSample = 0;
-    bool intPath = false;
-    float sample = 0.f;
 
     switch(noiseData.noiseType) {
-        case NOISE_WHITE: sample = (float)nextWhite() * (5.0f / 32768.0f); break;
-        case NOISE_PINK:  sample = nextPink() * 15.3f; break;
-        case NOISE_BLUE:  sample = nextBlue() * 2.5f; break;
-        case NOISE_VIOLET: sample = nextViolet() * 5.0f; break;
+        case NOISE_WHITE: outSample = nextWhite(); break;
+        case NOISE_PINK:  outSample = nextPink(); break;
+        case NOISE_BLUE:  outSample = nextBlue(); break;
+        case NOISE_VIOLET: outSample = nextViolet(); break;
         case NOISE_VELVET: {
             // Velvet rate: 10Hz to 10000Hz based on character
             float velvetRate = pow(10.f, 1.f + 3.f * tone);
-            velvetProb = velvetRate * (1.0f/44100.f);
-            outSample = (int32_t)nextVelvet(velvetProb);
-            intPath = true;
+            velvetThresh = (uint32_t)(velvetRate * (1.0f/44100.f) * 4294967296.0f);
+            outSample = nextVelvet(velvetThresh);
             break;
         }
         case NOISE_CMOS: {
-            // CMOS rate: 1000Hz to ~63kHz (Nyquist is 22050, but equation says +1.8f) 
+            // CMOS rate: 1000Hz to ~63kHz
             cmosRate = pow(10.f, 3.f + 1.8f * tone);
-            sample = nextCmos(cmosRate) * 2.88f; 
+            outSample = (int32_t)(nextCmos(cmosRate) * 2147483647.0f);
             break;
         }
         case NOISE_8BIT: {
             // 8-bit rate: 10Hz to 10000Hz
             eightBitRate = pow(10.f, 1.f + 3.f * tone);
-            sample = next8Bit(eightBitRate) * 2.88f;
+            outSample = (int32_t)(next8Bit(eightBitRate) * 2147483647.0f);
             break;
         }
     }
 
-    // Apply Filter for White, Pink, Blue, Violet
+    // Apply Q1.31 LP/HP filter for White, Pink, Blue, Violet
     // Velvet, CMOS, 8-bit don't get filtering — tone controls their rate.
     if (noiseData.noiseType <= NOISE_VIOLET) {
-        lpState += gLp * (sample - lpState);
-        hpState += gHp * (sample - hpState);
+        lpState += q31_mul(gLp_q31, outSample - lpState);
+        hpState += q31_mul(gHp_q31, outSample - hpState);
         if (isHp) {
-            sample = sample - hpState;
+            outSample = outSample - hpState;
         } else {
-            sample = lpState;
+            outSample = lpState;
         }
     }
 
-    if (!intPath) {
-        if (isnan(sample) || isinf(sample)) {
-            sample = 0.0f;
-        }
-        // Convert to 16-bit for DAC output
-        outSample = (int32_t)(sample * 6553.4f); 
-        if (outSample > 32767) outSample = 32767;
-        if (outSample < -32768) outSample = -32768;
-    }
+    // Convert Q1.31 to 16-bit DAC output: take upper 16 bits
+    int16_t dacOut = (int16_t)(outSample >> 16);
 
     // Write twice because the DAC is stereo
-    DAC.write(outSample); 
-    DAC.write(outSample); 
+    DAC.write(dacOut); 
+    DAC.write(dacOut); 
 }
