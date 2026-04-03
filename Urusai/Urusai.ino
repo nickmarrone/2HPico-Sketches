@@ -6,8 +6,36 @@
 I2S DAC(OUTPUT);
 Adafruit_NeoPixel strip(NUMPIXELS, LEDPIN, NEO_GRB + NEO_KHZ800);
 
+#define NOISE_WHITE 0
+#define NOISE_PINK 1
+#define NOISE_BLUE 2
+#define NOISE_VIOLET 3
+#define NOISE_VELVET 4
+#define NOISE_CMOS 5
+#define NOISE_8BIT 6
+
+struct NoiseData {
+    uint8_t noiseType;
+    float tone;
+};
+
+// Parameters are shared across cores through SRAM
+volatile NoiseData noiseData;
+
+// Only update the parameters every PARAMETERUPDATE
+uint32_t parameterTimer = 0;
+
 void setup() {
+    // Initialize serial communication at 115200 bits per second
     Serial.begin(115200);
+
+    // Wait for the serial port to connect. 
+    // This is vital on RP2350 so you don't miss the first few prints!
+    while (!Serial) {
+        ; // wait for serial port to connect. Needed for native USB
+    }
+    
+    Serial.println("RP2350 Debugging Started...");
 
     // Initialise UI
     pinMode(BUTTON1, INPUT_PULLUP);
@@ -29,50 +57,51 @@ void setup() {
     while(rp2040.fifo.available()) rp2040.fifo.pop();
 }
 
-void loop() {
-    samplepots();
-    uint16_t cv2 = sampleCV2();
+// Noise type is controlled by rotating pot 1
+inline uint8_t getNoiseType(uint16_t pot1) {
+    uint8_t noiseType = (pot1 * 7) / 4096;
+    if (noiseType > 6) noiseType = 6;
+    return noiseType;
+}
 
-    // Tone = Pot 3 (pot[2]) + CV2
-    // Assuming CV2 gives roughly 2048 at 0V. Standard Eurorack CV.
-    float tone = (float)pot[2] / 4095.0f;
+inline float getTone(uint16_t pot3, uint16_t cv2) {
+    float tone = (float)pot3 / 4095.0f;
     float cv_norm = ((float)cv2 - 2048.0f) / 2048.0f; 
     tone += cv_norm;
     if (tone < 0.0f) tone = 0.0f;
     if (tone > 1.0f) tone = 1.0f;
+    return tone;
+}
 
-    // Noise type = Pot 1 (pot[0])
-    // 7 types total: 0-6
-    int noiseType = (pot[0] * 7) / 4096;
-    if (noiseType > 6) noiseType = 6;
+uint32_t colors[7] = {
+    WHITE,          // White
+    0x1f081f,       // Pink (Pinkish)
+    BLUE,           // Blue
+    VIOLET,         // Violet
+    RED,            // Velvet
+    GREEN,          // CMOS
+    YELLOW          // 8-bit
+};
 
-    uint32_t colors[7] = {
-        WHITE,          // White
-        0x1f081f,       // Pink (Pinkish)
-        BLUE,           // Blue
-        VIOLET,         // Violet
-        YELLOW,         // Velvet
-        RED,            // CMOS
-        GREEN           // 8-bit
-    };
+void loop() {
+    static uint32_t parameterTimer = millis();
+    if ((millis() - parameterTimer) > PARAMETERUPDATE) {
+        parameterTimer = millis();
 
-    strip.setPixelColor(0, colors[noiseType]);
-    strip.show();
+        // Do not update the the parameters too frequently
+        samplepots();
+        uint16_t cv2 = sampleCV2();
 
-    // Pack into uint32_t to push through FIFO
-    // tone is 0 to 1.0 -> map to 0 to 65535
-    uint32_t packedTone = (uint32_t)(tone * 65535.0f);
-    uint32_t pushData = (noiseType << 16) | (packedTone & 0xFFFF);
-    
-    // Only push if changed to avoid filling FIFO
-    static uint32_t lastPush = 0xFFFFFFFF; // force push on startup
-    if (pushData != lastPush) {
-        if (rp2040.fifo.push_nb(pushData)) {
-            lastPush = pushData;
-        }
+        // Noise type = Pot 1 (pot[0]): 7 types total: 0-6
+        noiseData.noiseType = getNoiseType(pot[0]);
+        strip.setPixelColor(0, colors[noiseData.noiseType]);
+        strip.show();
+
+        // Tone = Pot 3 (pot[2]) + CV2
+        noiseData.tone = getTone(pot[2], cv2);
+
+        Serial.printf("Noise Type: %d, Tone: %f\n", noiseData.noiseType, noiseData.tone); 
     }
-
-    delay(2);
 }
 
 // ============================================
@@ -174,7 +203,7 @@ void setup1() {
 
 void loop1() {
     static int currentNoiseType = 0;
-    static float character = 0.5f;
+    static float tone = 0.5f;
     
     static float lpCutoff = 1000.f;
     static float hpCutoff = 1000.f;
@@ -189,51 +218,54 @@ void loop1() {
     static float lpState = 0.f;
     static float hpState = 0.f;
 
-    if (rp2040.fifo.available()) {
-        uint32_t data = rp2040.fifo.pop();
-        currentNoiseType = data >> 16;
-        character = (float)(data & 0xFFFF) / 65535.f;
+    tone = noiseData.tone;
 
-        // Recalculate coefficients
-        float lp_char = character / 0.5f;
-        if (lp_char > 1.0f) lp_char = 1.0f;
-        lpCutoff = pow(10.f, 1.f + 3.3f * lp_char);
-        
-        float hp_char = (character - 0.5f) / 0.5f;
-        if (hp_char < 0.0f) hp_char = 0.0f;
-        hpCutoff = pow(10.f, 1.f + 3.3f * hp_char);
+    // TODO: Only recalculate the data that is necessary
+    // Recalculate coefficients
+    float lp_tone = tone / 0.5f;
+    if (lp_tone > 1.0f) lp_tone = 1.0f;
+    lpCutoff = pow(10.f, 1.f + 3.3f * lp_tone);
+    
+    float hp_tone = (tone - 0.5f) / 0.5f;
+    if (hp_tone < 0.0f) hp_tone = 0.0f;
+    hpCutoff = pow(10.f, 1.f + 3.3f * hp_tone);
 
-        gLp = lpCutoff * (1.0f/44100.f) * 3.14159f;
-        if (gLp > 1.0f) gLp = 1.0f;
-        
-        gHp = hpCutoff * (1.0f/44100.f) * 3.14159f;
-        if (gHp > 1.0f) gHp = 1.0f;
+    gLp = lpCutoff * (1.0f/44100.f) * 3.14159f;
+    if (gLp > 1.0f) gLp = 1.0f;
+    
+    gHp = hpCutoff * (1.0f/44100.f) * 3.14159f;
+    if (gHp > 1.0f) gHp = 1.0f;
 
-        isHp = character >= 0.5f;
-
-        // Velvet rate: 10Hz to 10000Hz based on character
-        float velvetRate = pow(10.f, 1.f + 3.f * character);
-        velvetProb = velvetRate * (1.0f/44100.f);
-
-        // CMOS rate: 1000Hz to ~63kHz (Nyquist is 22050, but equation says +1.8f) 
-        cmosRate = pow(10.f, 3.f + 1.8f * character);
-
-        // 8-bit rate: 10Hz to 10000Hz
-        eightBitRate = pow(10.f, 1.f + 3.f * character);
-    }
+    isHp = tone >= 0.5f;
 
     whiteGenerated = false;
     pinkGenerated = false;
 
     float sample = 0.f;
-    switch(currentNoiseType) {
+    switch(noiseData.noiseType) {
         case 0: sample = nextWhite() * 5.0f; break;
         case 1: sample = nextPink() * 15.3f; break;
         case 2: sample = nextBlue() * 2.5f; break;
         case 3: sample = nextViolet() * 5.0f; break;
-        case 4: sample = nextVelvet(velvetProb) * 11.0f; break;
-        case 5: sample = nextCmos(cmosRate) * 2.88f; break;
-        case 6: sample = next8Bit(eightBitRate) * 2.88f; break;
+        case 4: {
+            // Velvet rate: 10Hz to 10000Hz based on character
+            float velvetRate = pow(10.f, 1.f + 3.f * tone);
+            velvetProb = velvetRate * (1.0f/44100.f);
+            sample = nextVelvet(velvetProb) * 11.0f; 
+            break;
+        }
+        case 5: {
+            // CMOS rate: 1000Hz to ~63kHz (Nyquist is 22050, but equation says +1.8f) 
+            cmosRate = pow(10.f, 3.f + 1.8f * tone);
+            sample = nextCmos(cmosRate) * 2.88f; 
+            break;
+        }
+        case 6: {
+            // 8-bit rate: 10Hz to 10000Hz
+            eightBitRate = pow(10.f, 1.f + 3.f * tone);
+            sample = next8Bit(eightBitRate) * 2.88f;
+            break;
+        }
     }
 
     // Apply Filter for White, Pink, Blue, Violet
@@ -253,12 +285,12 @@ void loop1() {
         sample = 0.0f;
     }
 
-    // convert to 16-bit
-    // VCV uses roughly -5.0 to 5.0 range for audio. Map this to -32768..32767
+    // Convert to 16-bit for DAC output -- map this to -32768..32767
     int32_t outSample = (int32_t)(sample * 6553.4f); 
     if (outSample > 32767) outSample = 32767;
     if (outSample < -32768) outSample = -32768;
 
+    // Write twice because the DAC is stereo
     DAC.write(outSample); 
     DAC.write(outSample); 
 }
