@@ -66,9 +66,10 @@ void loop() {
     
     // Only push if changed to avoid filling FIFO
     static uint32_t lastPush = 0;
-    if (pushData != lastPush && rp2040.fifo.availableForOutput()) {
-        rp2040.fifo.push_nb(pushData);
-        lastPush = pushData;
+    if (pushData != lastPush) {
+        if (rp2040.fifo.push_nb(pushData)) {
+            lastPush = pushData;
+        }
     }
 
     delay(2);
