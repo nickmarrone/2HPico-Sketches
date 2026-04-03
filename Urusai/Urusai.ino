@@ -29,15 +29,17 @@ uint32_t parameterTimer = 0;
 
 void setup() {
     if (DEBUG) {
-        // Initialize serial communication at 115200 bits per second
         Serial.begin(115200);
 
-        // Wait for the serial port to connect. 
-        // This is vital on RP2350 so you don't miss the first few prints!
-        while (!Serial) {
-            ; // wait for serial port to connect. Needed for native USB
+        // Record the start time
+        unsigned long startTime = millis();
+
+        // Wait for Serial OR for 3 seconds to pass
+        while (!Serial && (millis() - startTime < 3000)) {
+            ; // Do nothing, just wait
         }
-        
+
+        // This will print if connected, or do nothing safely if not
         Serial.println("RP2350 Debugging Started...");
     }
 
