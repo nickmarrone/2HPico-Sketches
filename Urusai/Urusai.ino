@@ -33,9 +33,9 @@ void loop() {
     samplepots();
     uint16_t cv2 = sampleCV2();
 
-    // Tone = Pot 4 (pot[3]) + CV2
+    // Tone = Pot 3 (pot[2]) + CV2
     // Assuming CV2 gives roughly 2048 at 0V. Standard Eurorack CV.
-    float tone = (float)pot[3] / 4095.0f;
+    float tone = (float)pot[2] / 4095.0f;
     float cv_norm = ((float)cv2 - 2048.0f) / 2048.0f; 
     tone += cv_norm;
     if (tone < 0.0f) tone = 0.0f;
@@ -65,7 +65,7 @@ void loop() {
     uint32_t pushData = (noiseType << 16) | (packedTone & 0xFFFF);
     
     // Only push if changed to avoid filling FIFO
-    static uint32_t lastPush = 0;
+    static uint32_t lastPush = 0xFFFFFFFF; // force push on startup
     if (pushData != lastPush) {
         if (rp2040.fifo.push_nb(pushData)) {
             lastPush = pushData;
@@ -249,8 +249,13 @@ void loop1() {
         }
     }
 
+    if (isnan(sample) || isinf(sample)) {
+        sample = 0.0f;
+    }
+
     // convert to 16-bit
-    int32_t outSample = (int32_t)(sample * 16383.0f); // Leave some headroom
+    // VCV uses roughly -5.0 to 5.0 range for audio. Map this to -32768..32767
+    int32_t outSample = (int32_t)(sample * 6553.4f); 
     if (outSample > 32767) outSample = 32767;
     if (outSample < -32768) outSample = -32768;
 
