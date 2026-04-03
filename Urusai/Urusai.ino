@@ -63,15 +63,16 @@ void setup() {
 
 // Noise type is controlled by rotating pot 1
 inline uint8_t getNoiseType(uint16_t pot1) {
-    uint8_t noiseType = (pot1 * 7) / 4096;
+    uint8_t noiseType = (pot1 * 7) / 1024;
     if (noiseType > 6) noiseType = 6;
     return noiseType;
 }
 
 inline float getTone(uint16_t pot3, uint16_t cv2) {
-    float tone = (float)pot3 / 4095.0f;
-    float cv_norm = ((float)cv2 - 2048.0f) / 2048.0f; 
-    tone += cv_norm;
+    float tone = (float)pot3 / 1023.0f; 
+    // TODO: Update for CV when we have the rest of the code working
+    // float cv_norm = ((float)cv2 - 512.0f) / 512.0f; 
+    // tone += cv_norm;
     if (tone < 0.0f) tone = 0.0f;
     if (tone > 1.0f) tone = 1.0f;
     return tone;
