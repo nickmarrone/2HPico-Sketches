@@ -6,7 +6,7 @@
 I2S DAC(OUTPUT);
 Adafruit_NeoPixel strip(NUMPIXELS, LEDPIN, NEO_GRB + NEO_KHZ800);
 
-const bool DEBUG = true;
+const bool DEBUG = false;
 
 #define NOISE_WHITE 0
 #define NOISE_PINK 1
@@ -125,21 +125,30 @@ float b0 = 0.f, b1_p = 0.f, b2 = 0.f, b3 = 0.f, b4 = 0.f, b5 = 0.f, b6 = 0.f;
 float lastWhite = 0.f;
 float lastPink = 0.f;
 
-// fast PRNG
-uint32_t rng_state = 123456789;
-inline float f_random() {
-    rng_state ^= rng_state << 13;
-    rng_state ^= rng_state >> 17;
-    rng_state ^= rng_state << 5;
-    return ((float)rng_state * (1.0f / 4294967296.0f)) * 2.0f - 1.0f; // -1.0 to 1.0
+// xoshiro128** PRNG — much better spectral quality for audio noise
+uint32_t rng_s[4] = {123456789, 362436069, 521288629, 88675123};
+
+inline int16_t i_random() {
+    uint32_t result = rng_s[1] * 5;
+    result = (result << 7 | result >> 25) * 9;
+
+    uint32_t t = rng_s[1] << 9;
+    rng_s[2] ^= rng_s[0];
+    rng_s[3] ^= rng_s[1];
+    rng_s[1] ^= rng_s[2];
+    rng_s[0] ^= rng_s[3];
+    rng_s[2] ^= t;
+    rng_s[3] = (rng_s[3] << 11) | (rng_s[3] >> 21);
+
+    return (int16_t)(result >> 16);
 }
 
-float whiteNoiseValue = 0.f;
+int16_t whiteNoiseValue = 0;
 bool whiteGenerated = false;
 
-inline float nextWhite() {
+inline int16_t nextWhite() {
     if (!whiteGenerated) {
-        whiteNoiseValue = f_random();
+        whiteNoiseValue = i_random();
         whiteGenerated = true;
     }
     return whiteNoiseValue;
@@ -150,7 +159,7 @@ bool pinkGenerated = false;
 
 inline float nextPink() {
     if (!pinkGenerated) {
-        float w = nextWhite();
+        float w = (float)nextWhite() * (1.0f / 32768.0f);
         b0 = 0.99886f * b0 + w * 0.0555179f;
         b1_p = 0.99332f * b1_p + w * 0.0750759f;
         b2 = 0.96900f * b2 + w * 0.1538520f;
@@ -173,17 +182,20 @@ inline float nextBlue() {
 }
 
 inline float nextViolet() {
-    float w = nextWhite();
+    float w = (float)nextWhite() * (1.0f / 32768.0f);
     float violet = w - lastWhite;
     lastWhite = w;
     return violet * 0.707f;
 }
 
-inline float nextVelvet(float p) {
-    if ((f_random() * 0.5f + 0.5f) < p) {
-        return f_random() > 0.0f ? 1.0f : -1.0f;
+inline int16_t nextVelvet(float p) {
+    // Integer probability comparison: scale p to 0-65535 range
+    uint32_t thresh = (uint32_t)(p * 65536.0f);
+    uint32_t r = (uint32_t)((int32_t)i_random() + 32768);
+    if (r < thresh) {
+        return i_random() >= 0 ? 32767 : -32768;
     }
-    return 0.f;
+    return 0;
 }
 
 inline float nextCmos(float rate) {
@@ -211,7 +223,7 @@ void setup1() {
 }
 
 void loop1() {
-    static int currentNoiseType = 0;
+
     static float tone = 0.5f;
     
     static float lpCutoff = 1000.f;
@@ -250,26 +262,30 @@ void loop1() {
     whiteGenerated = false;
     pinkGenerated = false;
 
+    int32_t outSample = 0;
+    bool intPath = false;
     float sample = 0.f;
+
     switch(noiseData.noiseType) {
-        case 0: sample = nextWhite() * 5.0f; break;
-        case 1: sample = nextPink() * 15.3f; break;
-        case 2: sample = nextBlue() * 2.5f; break;
-        case 3: sample = nextViolet() * 5.0f; break;
-        case 4: {
+        case NOISE_WHITE: sample = (float)nextWhite() * (5.0f / 32768.0f); break;
+        case NOISE_PINK:  sample = nextPink() * 15.3f; break;
+        case NOISE_BLUE:  sample = nextBlue() * 2.5f; break;
+        case NOISE_VIOLET: sample = nextViolet() * 5.0f; break;
+        case NOISE_VELVET: {
             // Velvet rate: 10Hz to 10000Hz based on character
             float velvetRate = pow(10.f, 1.f + 3.f * tone);
             velvetProb = velvetRate * (1.0f/44100.f);
-            sample = nextVelvet(velvetProb) * 11.0f; 
+            outSample = (int32_t)nextVelvet(velvetProb);
+            intPath = true;
             break;
         }
-        case 5: {
+        case NOISE_CMOS: {
             // CMOS rate: 1000Hz to ~63kHz (Nyquist is 22050, but equation says +1.8f) 
             cmosRate = pow(10.f, 3.f + 1.8f * tone);
             sample = nextCmos(cmosRate) * 2.88f; 
             break;
         }
-        case 6: {
+        case NOISE_8BIT: {
             // 8-bit rate: 10Hz to 10000Hz
             eightBitRate = pow(10.f, 1.f + 3.f * tone);
             sample = next8Bit(eightBitRate) * 2.88f;
@@ -278,9 +294,8 @@ void loop1() {
     }
 
     // Apply Filter for White, Pink, Blue, Violet
-    // In original code, filtering was applied to White, Pink, Blue, Violet. 
-    // Velvet, CMOS, 8-bit don't get filtering, the tone controls their rate.
-    if (currentNoiseType <= 3) {
+    // Velvet, CMOS, 8-bit don't get filtering — tone controls their rate.
+    if (noiseData.noiseType <= NOISE_VIOLET) {
         lpState += gLp * (sample - lpState);
         hpState += gHp * (sample - hpState);
         if (isHp) {
@@ -290,14 +305,15 @@ void loop1() {
         }
     }
 
-    if (isnan(sample) || isinf(sample)) {
-        sample = 0.0f;
+    if (!intPath) {
+        if (isnan(sample) || isinf(sample)) {
+            sample = 0.0f;
+        }
+        // Convert to 16-bit for DAC output
+        outSample = (int32_t)(sample * 6553.4f); 
+        if (outSample > 32767) outSample = 32767;
+        if (outSample < -32768) outSample = -32768;
     }
-
-    // Convert to 16-bit for DAC output -- map this to -32768..32767
-    int32_t outSample = (int32_t)(sample * 6553.4f); 
-    if (outSample > 32767) outSample = 32767;
-    if (outSample < -32768) outSample = -32768;
 
     // Write twice because the DAC is stereo
     DAC.write(outSample); 
