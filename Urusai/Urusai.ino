@@ -6,6 +6,8 @@
 I2S DAC(OUTPUT);
 Adafruit_NeoPixel strip(NUMPIXELS, LEDPIN, NEO_GRB + NEO_KHZ800);
 
+const bool DEBUG = true;
+
 #define NOISE_WHITE 0
 #define NOISE_PINK 1
 #define NOISE_BLUE 2
@@ -26,16 +28,18 @@ volatile NoiseData noiseData;
 uint32_t parameterTimer = 0;
 
 void setup() {
-    // Initialize serial communication at 115200 bits per second
-    Serial.begin(115200);
+    if (DEBUG) {
+        // Initialize serial communication at 115200 bits per second
+        Serial.begin(115200);
 
-    // Wait for the serial port to connect. 
-    // This is vital on RP2350 so you don't miss the first few prints!
-    while (!Serial) {
-        ; // wait for serial port to connect. Needed for native USB
+        // Wait for the serial port to connect. 
+        // This is vital on RP2350 so you don't miss the first few prints!
+        while (!Serial) {
+            ; // wait for serial port to connect. Needed for native USB
+        }
+        
+        Serial.println("RP2350 Debugging Started...");
     }
-    
-    Serial.println("RP2350 Debugging Started...");
 
     // Initialise UI
     pinMode(BUTTON1, INPUT_PULLUP);
@@ -100,7 +104,9 @@ void loop() {
         // Tone = Pot 3 (pot[2]) + CV2
         noiseData.tone = getTone(pot[2], cv2);
 
-        Serial.printf("Noise Type: %d, Tone: %f\n", noiseData.noiseType, noiseData.tone); 
+        if (DEBUG) {
+            Serial.printf("Noise Type: %d (%d), Tone: %f (%d, %d)\n", noiseData.noiseType, pot[0], noiseData.tone, pot[2], cv2); 
+        }
     }
 }
 
